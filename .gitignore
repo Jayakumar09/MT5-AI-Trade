@@ -1,0 +1,13 @@
+# QUANT PILOT — local artifacts & secrets
+.env
+data/
+logs/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+_staging/
+*.db
+.DS_Store

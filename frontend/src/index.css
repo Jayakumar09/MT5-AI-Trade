@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --space: #05060f;
+  --panel: rgba(13, 17, 38, 0.55);
+  --neon: #22d3ee;
+  --violet2: #8b5cf6;
+  --emerald2: #34d399;
+  --rose2: #fb7185;
+  --amber2: #fbbf24;
+  --ink: #e6edf7;
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--space);
+  color: var(--ink);
+  font-family: Inter, system-ui, sans-serif;
+  overflow: hidden;
+}
+
+* { cursor: none !important; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  * { cursor: auto !important; }
+}
+
+.glass {
+  background: var(--panel);
+  border: 1px solid rgba(120, 160, 255, 0.14);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-radius: 1.1rem;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255,255,255,0.06);
+}
+
+.gradient-text {
+  background: linear-gradient(115deg, #22d3ee 0%, #8b5cf6 45%, #fb7185 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.neon-border { border: 1px solid rgba(34, 211, 238, 0.35); box-shadow: 0 0 18px rgba(34,211,238,0.14); }
+.viewport-grid {
+  background-image:
+    radial-gradient(circle at 20% 10%, rgba(139,92,246,0.16), transparent 45%),
+    radial-gradient(circle at 85% 80%, rgba(34,211,238,0.12), transparent 40%),
+    linear-gradient(rgba(120,160,255,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(120,160,255,0.05) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 44px 44px, 44px 44px;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: rgba(255,255,255,0.04); border-radius: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(120,160,255,0.28); border-radius: 8px; }
+
+.shimmer {
+  background: linear-gradient(110deg, rgba(255,255,255,0.02) 30%, rgba(255,255,255,0.10) 50%, rgba(255,255,255,0.02) 70%);
+  background-size: 200% 100%;
+  animation: shimmer 2.2s linear infinite;
+}
+
+.tabular { font-variant-numeric: tabular-nums; }

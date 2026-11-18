@@ -1,50 +1,45 @@
-"""Hunter agent – sweep + displacement detection.
+"""Hunter — Sweep Detector.
 
-Rule-based: finds liquidity sweeps with exact numbers and returns candidate
-setups for the Analyst to refine.
+Rule-based sweep + displacement detection on the 5M chart. Returns candidate
+setups with exact numbers.
 """
+
 from __future__ import annotations
 
 import time
-from typing import Any
 
-from ..models import AgentResult, Candle, SweepCandidate
-from ..strategy import LiquidityLevel, detect_sweep
-from .base import BaseAgent
+from ..strategy import detect_sweep, XAUUSD_PIPS_PER_POINT
+from .base import Agent
 
 
-class HunterAgent(BaseAgent):
-    name = "hunter"
+class HunterAgent(Agent):
+    name = "HUNTER"
 
-    def run(self, context: dict[str, Any]) -> AgentResult:
-        start = time.time()
-        instrument = context.get("instrument", "XAUUSD")
-        candles = [Candle(**c) for c in context.get("candles_5m", [])]
-        levels_raw = context.get("levels", [])
-        levels = [LiquidityLevel(l["level_type"], float(l["price"])) for l in levels_raw]
+    def run(self, context: dict):
+        started = time.perf_counter()
+        instrument: str = context.get("instrument", "XAUUSD")
+        candles = (context.get("candles") or {}).get("5m") or []
+        levels = context.get("liquidity_levels") or (context.get("scout_data") or {}).get("liquidity_levels") or []
 
-        candidates = detect_sweep(candles, instrument, levels)
-        latency = self.timed(start)
+        candidate = detect_sweep(instrument, candles, levels)
 
-        if not candidates:
+        if candidate is None:
             return self._result(
-                "no_data",
-                "Hunter: no sweep detected this cycle",
-                {"instrument": instrument, "candidates": []},
-                confidence=3,
-                latency_ms=latency,
+                "NO_TRADE",
+                f"No sweep + displacement pattern detected on {instrument} — standing by",
+                data={"instrument": instrument},
+                confidence=0.0,
+                started=started,
             )
 
-        best = candidates[0]
+        candidate["instrument"] = instrument
         return self._result(
-            "ok",
-            f"Hunter: {best.direction.upper()} sweep at {best.level_type} {best.level_price:.2f} "
-            f"depth {best.extension_depth:.2f} quality {best.displacement_quality}",
-            {
-                "instrument": instrument,
-                "candidates": [c.model_dump() for c in candidates],
-                "count": len(candidates),
-            },
-            confidence=8,
-            latency_ms=latency,
+            "CANDIDATE",
+            (
+                f"Sweep detected on {instrument}: {candidate['direction']} @ {candidate['entry_price']:.2f} "
+                f"(SL {candidate['stop_loss']:.2f} / TP1 {candidate['take_profit_1']:.2f}, RR {candidate['risk_reward_ratio']})"
+            ),
+            data={"candidate": candidate},
+            confidence=0.7,
+            started=started,
         )

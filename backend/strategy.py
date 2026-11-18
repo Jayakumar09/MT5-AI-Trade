@@ -1,228 +1,193 @@
-"""Liquidity Sweep strategy – deterministic detection engine.
+"""Liquidity Sweep strategy logic for QUANT PILOT.
 
-A liquidity sweep: price pierces a known liquidity level (PDH/PDL, Asian
+Strategy: Price pierces a known liquidity level (PDH/PDL, Asian/London/New York
 session high/low, 4H swing high/low, equal highs/lows), then a displacement
 candle closes back inside the range.
 
-Depth: XAUUSD 10-25 pips beyond the level; BTCUSD 0.15%-0.4%.
-Displacement: closes back inside within 3 candles, body >= 1.2x avg body.
-Entry: on the confirmation close, or pullback to 50% of the sweep wick.
-SL: beyond the wick extreme + buffer (5 pips XAUUSD, 0.1% BTC).
-TP1 at 1:2 RR; TP2 at the next liquidity pool (1:3+).
+Sweep depth: XAUUSD 10-25 pips beyond the level; BTCUSD 0.15%-0.4%.
+Displacement: closes back inside within 3 candles, body at least 1.2x the
+average body (volume spike is a bonus).
 """
-from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable
+from __future__ import annotations
 
 import numpy as np
 
-from .models import Candle, SweepCandidate
+from .core.indicators import atr
+from .core.models import Candle
 
-# Smallest price unit we call a "pip" per instrument (demo convention).
-PIP = {"XAUUSD": 0.10, "BTCUSD": 0.01}
-SL_BUFFER_PIPS_XAU = 5.0          # 5 pips beyond wick extreme
-SL_BUFFER_PCT_BTC = 0.001         # 0.1% beyond wick extreme
-DISPLACEMENT_BODY_MULT = 1.2      # body >= 1.2x average body
-MAX_CANDLES_TO_CLOSE = 3          # must close back inside within 3 candles
-
-
-def pip_size(instrument: str) -> float:
-    return PIP.get(instrument.upper(), 0.01)
+# Spec constants
+XAUUSD_PIPS_PER_POINT = 0.1          # 1 pip = $0.1 (0.10 USD)
+XAUUSD_SPREAD_LIMIT = 35             # points
+BTC_SPREAD_LIMIT = 500               # configurable, points (of 0.01 centimetre)
 
 
-def depth_bounds(instrument: str) -> tuple[float, float]:
-    """Return (min_depth, max_depth) in price units."""
+def is_sweep_depth_valid(instrument: str, sweep_depth: float, reference_price: float | None = None) -> bool:
+    """Return True if the sweep depth is within the valid range for the instrument.
+
+    For BTCUSD the spec defines the depth as a percentage (0.15%–0.4%) of the
+    swept level. Pass ``reference_price`` to convert an absolute depth, or pass
+    an already-relative fraction as ``sweep_depth``.
+    """
     if instrument.upper().startswith("XAU"):
-        p = pip_size(instrument)
-        return (10 * p, 25 * p)
-    return (0.0015, 0.004)  # BTCUSD: fraction of level price
+        pips = sweep_depth / XAUUSD_PIPS_PER_POINT
+        return 10.0 <= pips <= 25.0
+    elif instrument.upper().startswith("BTC"):
+        if reference_price and reference_price > 0:
+            pct = sweep_depth / reference_price
+        else:
+            pct = sweep_depth
+        return 0.0015 <= pct <= 0.004
+    return False
 
 
-def sl_buffer(instrument: str, level_price: float) -> float:
-    """SL buffer beyond the wick extreme, in price units."""
-    if instrument.upper().startswith("XAU"):
-        return SL_BUFFER_PIPS_XAU * pip_size(instrument)
-    return SL_BUFFER_PCT_BTC * level_price
+def displacement_strength(candles: list[Candle], lookback: int = 20) -> float:
+    """Return the displacement strength as a ratio of body to average body."""
+    if len(candles) < 2:
+        return 1.0
+    closes = [c.close for c in candles]
+    avg_body = float(np.mean([abs(c.close - c.open) for c in candles[-lookback:]]))
+    if avg_body <= 0:
+        avg_body = 1e-9
+    cur = abs(candles[-1].close - candles[-1].open)
+    return cur / avg_body
 
 
-@dataclass
-class LiquidityLevel:
-    level_type: str  # PDH / PDL / ASIAN_HIGH / ASIAN_LOW / SWING_HIGH / SWING_LOW / EQUAL_HIGHS / EQUAL_LOWS
-    price: float
-
-
-def avg_body(candles: list[Candle], period: int = 20) -> float:
-    bodies = [abs(c.close - c.open) for c in candles[-period:]]
-    return float(np.mean(bodies)) if bodies else 0.0
-
-
-def atr(candles: list[Candle], period: int = 14) -> float:
-    if len(candles) <= period:
-        return 0.0
-    trs = []
-    for i in range(period, len(candles)):
-        hi, lo = candles[i].high, candles[i].low
-        prev = candles[i - 1]
-        trs.append(max(hi - lo, abs(hi - prev.close), abs(lo - prev.close)))
-    return float(np.mean(trs)) if trs else 0.0
-
-
-def swing_levels(highs: np.ndarray, lows: np.ndarray, lookback: int = 3) -> list[LiquidityLevel]:
-    """Extract swing high / swing low liquidity levels."""
-    levels: list[LiquidityLevel] = []
-    n = len(highs)
-    for i in range(lookback, n - lookback):
-        if highs[i] == max(highs[i - lookback:i + lookback + 1]) and highs[i] > highs[i - 1]:
-            if not any(abs(highs[i] - l.price) < 1e-9 for l in levels):
-                levels.append(LiquidityLevel("SWING_HIGH", float(highs[i])))
-        if lows[i] == min(lows[i - lookback:i + lookback + 1]) and lows[i] < lows[i - 1]:
-            if not any(abs(lows[i] - l.price) < 1e-9 for l in levels):
-                levels.append(LiquidityLevel("SWING_LOW", float(lows[i])))
-    return levels
-
-
-def equal_highs(highs: np.ndarray, tol: float = 1e-6) -> list[float]:
-    out = []
-    for i in range(len(highs) - 1):
-        if abs(highs[i] - highs[i + 1]) <= tol and not any(abs(highs[i] - x) < tol for x in out):
-            out.append(float(highs[i]))
-    return out
-
-
-def equal_lows(lows: np.ndarray, tol: float = 1e-6) -> list[float]:
-    out = []
-    for i in range(len(lows) - 1):
-        if abs(lows[i] - lows[i + 1]) <= tol and not any(abs(lows[i] - x) < tol for x in out):
-            out.append(float(lows[i]))
-    return out
-
-
-def _is_resistance(lt: str) -> bool:
-    return lt in {"PDH", "ASIAN_HIGH", "SWING_HIGH", "EQUAL_HIGHS"}
+def detect_displacement_candle(candles: list[Candle], direction: str) -> bool:
+    """Return True if the last candle is a valid displacement candle in the given direction."""
+    if not candles:
+        return False
+    last = candles[-1]
+    body = abs(last.close - last.open)
+    avg_body = float(np.mean([abs(c.close - c.open) for c in candles[-21:-1]])) if len(candles) > 1 else body
+    if avg_body <= 0:
+        avg_body = 1e-9
+    ratio = body / avg_body
+    if ratio < 1.2:
+        return False
+    if direction == "LONG":  # bullish reversal after sweep below
+        return last.close >= last.open and last.close > candles[-2].close
+    return last.close <= last.open and last.close < candles[-2].close
 
 
 def detect_sweep(
-    candles: list[Candle],
     instrument: str,
-    extra_levels: Iterable[LiquidityLevel] | None = None,
-) -> list[SweepCandidate]:
-    """Scan the most recent candles for liquidity sweeps. Returns candidates."""
-    if len(candles) < 10:
-        return []
+    candles: list[Candle],
+    liquidity_levels: list[dict],
+) -> dict | None:
+    """Detect a liquidity sweep + displacement pattern.
 
-    highs = np.array([c.high for c in candles], dtype=float)
-    lows = np.array([c.low for c in candles], dtype=float)
+    Returns a candidate setup dict or None if no sweep is detected.
+    """
+    if len(candles) < 50:
+        return None
 
-    levels: list[LiquidityLevel] = list(extra_levels or [])
-    if not levels:
-        levels += swing_levels(highs, lows)
-        levels.append(LiquidityLevel("PDH", float(highs.max())))
-        levels.append(LiquidityLevel("PDL", float(lows.min())))
-        for p in equal_highs(highs):
-            levels.append(LiquidityLevel("EQUAL_HIGHS", float(p)))
-        for p in equal_lows(lows):
-            levels.append(LiquidityLevel("EQUAL_LOWS", float(p)))
+    ohlcv = [c.close for c in candles]
+    highs = [c.high for c in candles]
+    lows = [c.low for c in candles]
+    opens = [c.open for c in candles]
 
-    body_avg = avg_body(candles)
-    candidates: list[SweepCandidate] = []
-    n = len(candles)
+    atr_vals = atr(highs, lows, ohlcv, 14)
+    atr_val = atr_vals[-1] if not np.isnan(atr_vals[-1]) else abs(highs[-1] - lows[-1]) or 1e-9
 
-    for level in levels:
-        resistance = _is_resistance(level.level_type)
-        # Search the last MAX_CANDLES_TO_CLOSE+1 candles for the sweep wick.
-        for i in range(max(0, n - MAX_CANDLES_TO_CLOSE - 2), n - 1):
-            wick = candles[i]
-            if resistance:
-                swept = wick.high > level.price
-                if not swept:
+    # average body over recent window
+    bodies = [abs(c.close - c.open) for c in candles]
+    avg_body = float(np.mean(bodies[-21:-1])) or 1e-9
+
+    # Candidate: swept a liquidity level and closed back inside
+    for level in liquidity_levels:
+        level_price = level["price"]
+        level_type = level.get("type", "UNKNOWN")
+        # Find a candle whose wick pierces the level
+        for i in range(max(0, len(candles) - 5), len(candles)):
+            c = candles[i]
+            # Bullish sweep: low pierced below level (sell-side liquidity) then close back above
+            if level.get("side", "below") == "below" and c.low < level_price:
+                if instrument.upper().startswith("XAU"):
+                    depth = level_price - c.low
+                    valid_depth = 10.0 <= (depth / XAUUSD_PIPS_PER_POINT) <= 25.0
+                else:
+                    depth = level_price - c.low
+                    rel_depth = depth / level_price if level_price else 0.0
+                    valid_depth = 0.0015 <= rel_depth <= 0.004
+                if not valid_depth:
                     continue
-                depth = wick.high - level.price
-                wick_extreme = wick.high
-            else:
-                swept = wick.low < level.price
-                if not swept:
+                # displacement check: close back inside within 3 candles
+                for j in range(i, min(i + 3, len(candles))):
+                    disp = candles[j]
+                    body = abs(disp.close - disp.open)
+                    if disp.close > level_price and body >= 1.2 * avg_body:
+                        entry = disp.close
+                        sl = min(lows[i:j + 1]) - (5 * XAUUSD_PIPS_PER_POINT if instrument.upper().startswith("XAU") else level_price * 0.001)
+                        # TP1: 1:2 RR using opposite range boundary
+                        opposite = [l for l in liquidity_levels if l.get("side") == "above"]
+                        tp1 = opposite[0]["price"] if opposite else entry + 2 * abs(entry - sl)
+                        tp2 = opposite[1]["price"] if len(opposite) > 1 else entry + 3 * abs(entry - sl)
+                        rr = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0.0
+                        return {
+                            "instrument": instrument,
+                            "direction": "LONG",
+                            "entry_price": entry,
+                            "stop_loss": sl,
+                            "take_profit_1": tp1,
+                            "take_profit_2": tp2,
+                            "risk_reward_ratio": round(rr, 2),
+                            "htf_level_targeted": f"{level_type} @ {level_price:.2f}",
+                            "sweep_details": {
+                                "extension_depth": round(depth, 4),
+                                "sweep_candle_index": i,
+                                "displacement_quality": round(body / avg_body, 2),
+                            },
+                            "liquidity_sweep": True,
+                            "level_price": level_price,
+                        }
+            # Bearish sweep: high pierced above level (buy-side liquidity) then close back below
+            if level.get("side", "above") == "above" and c.high > level_price:
+                if instrument.upper().startswith("XAU"):
+                    depth = c.high - level_price
+                    valid_depth = 10.0 <= (depth / XAUUSD_PIPS_PER_POINT) <= 25.0
+                else:
+                    depth = c.high - level_price
+                    rel_depth = depth / level_price if level_price else 0.0
+                    valid_depth = 0.0015 <= rel_depth <= 0.004
+                if not valid_depth:
                     continue
-                depth = level.price - wick.low
-                wick_extreme = wick.low
-
-            # Depth gate: must pierce by at least the minimum (per instrument).
-            min_d, max_d = depth_bounds(instrument)
-            if instrument.upper().startswith("BTC"):
-                min_d = min_d * level.price
-                max_d = max_d * level.price
-            if depth < min_d:
-                continue
-
-            # Find displacement candle that closes back inside within 3 candles.
-            disp_idx = None
-            for j in range(i + 1, min(i + 1 + MAX_CANDLES_TO_CLOSE, n)):
-                c = candles[j]
-                if resistance and c.close < level.price:
-                    disp_idx = j
-                    break
-                if (not resistance) and c.close > level.price:
-                    disp_idx = j
-                    break
-            if disp_idx is None:
-                continue
-
-            disp = candles[disp_idx]
-            body = abs(disp.close - disp.open)
-            if body < DISPLACEMENT_BODY_MULT * body_avg:
-                continue  # displacement too weak
-
-            direction = "short" if resistance else "long"
-            entry = disp.close
-            buf = sl_buffer(instrument, level.price)
-            if direction == "short":
-                stop_loss = wick_extreme + buf
-                tp1 = entry - 2 * abs(entry - stop_loss)
-                tp2 = entry - 3 * abs(entry - stop_loss)
-            else:
-                stop_loss = wick_extreme - buf
-                tp1 = entry + 2 * abs(entry - stop_loss)
-                tp2 = entry + 3 * abs(entry - stop_loss)
-
-            risk = abs(entry - stop_loss)
-            rr1 = abs(tp1 - entry) / risk if risk > 0 else 0.0
-            rr2 = abs(tp2 - entry) / risk if risk > 0 else 0.0
-            quality = min(1.0, depth / (max_d if not resistance else max_d) )
-
-            candidates.append(
-                SweepCandidate(
-                    instrument=instrument,
-                    direction=direction,
-                    level_type=level.level_type,
-                    level_price=level.price,
-                    wick_extreme=wick_extreme,
-                    extension_depth=depth,
-                    candles_to_close=disp_idx - i,
-                    displacement_quality=round(quality, 3),
-                    entry_price=entry,
-                    stop_loss=stop_loss,
-                    take_profit_1=tp1,
-                    take_profit_2=tp2,
-                    risk_reward_ratio=round(max(rr1, rr2), 2),
-                    session="LONDON",
-                )
-            )
-            # one candidate per level
-            break
-
-    return candidates
+                for j in range(i, min(i + 3, len(candles))):
+                    disp = candles[j]
+                    body = abs(disp.close - disp.open)
+                    if disp.close < level_price and body >= 1.2 * avg_body:
+                        entry = disp.close
+                        sl = max(highs[i:j + 1]) + (5 * XAUUSD_PIPS_PER_POINT if instrument.upper().startswith("XAU") else level_price * 0.001)
+                        opposite = [l for l in liquidity_levels if l.get("side") == "below"]
+                        tp1 = opposite[0]["price"] if opposite else entry - 2 * abs(entry - sl)
+                        tp2 = opposite[1]["price"] if len(opposite) > 1 else entry - 3 * abs(entry - sl)
+                        rr = abs(entry - tp1) / abs(entry - sl) if abs(entry - sl) > 0 else 0.0
+                        return {
+                            "instrument": instrument,
+                            "direction": "SHORT",
+                            "entry_price": entry,
+                            "stop_loss": sl,
+                            "take_profit_1": tp1,
+                            "take_profit_2": tp2,
+                            "risk_reward_ratio": round(rr, 2),
+                            "htf_level_targeted": f"{level_type} @ {level_price:.2f}",
+                            "sweep_details": {
+                                "extension_depth": round(depth, 4),
+                                "sweep_candle_index": i,
+                                "displacement_quality": round(body / avg_body, 2),
+                            },
+                            "liquidity_sweep": True,
+                            "level_price": level_price,
+                        }
+    return None
 
 
-def compute_indicators(candles: list[Candle]) -> dict:
-    if len(candles) < 2:
-        return {"sma20": 0.0, "ema5": 0.0, "atr14": 0.0, "rsi14": 50.0}
-    closes = np.array([c.close for c in candles], dtype=float)
-    sma20 = float(np.mean(closes[-20:])) if len(closes) >= 20 else float(np.mean(closes))
-    ema5 = float(np.mean(closes[-5:]))
-    a14 = atr(candles, 14)
-    deltas = np.diff(closes[-15:])
-    gain = float(np.mean([d for d in deltas if d > 0])) if len(deltas) else 0.0
-    loss = float(np.mean([abs(d) for d in deltas if d < 0])) if len(deltas) else 0.0
-    rs = gain / loss if loss > 0 else 100.0
-    rsi = float(100 - (100 / (1 + rs)))
-    return {"sma20": sma20, "ema5": ema5, "atr14": a14, "rsi14": round(rsi, 2)}
+__all__ = [
+    "detect_sweep",
+    "detect_displacement_candle",
+    "displacement_strength",
+    "is_sweep_depth_valid",
+    "XAUUSD_PIPS_PER_POINT",
+    "XAUUSD_SPREAD_LIMIT",
+    "BTC_SPREAD_LIMIT",
+]

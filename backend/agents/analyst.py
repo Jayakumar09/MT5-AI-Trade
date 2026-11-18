@@ -1,197 +1,169 @@
-"""Analyst agent – Claude refinement of the Hunter's candidate.
+"""Analyst — Claude (LLM) decision layer.
 
-Sends the candidate plus compact context to Claude (claude-sonnet-5-5) and
-requires STRICT JSON validated by Pydantic. Claude may only refine or reject
-the Hunter's candidate – never invent prices. On invalid JSON we retry once,
-then fall back to NO_TRADE. If the API key is missing we use a rule-based
-mock so the app still works end-to-end in Demo Mode.
+Gets the Hunter's candidate plus compact context and returns STRICT JSON
+validated by Pydantic (``AnalysisDecision``). Retries once on invalid JSON,
+then returns NO_TRADE. Claude may only refine or reject the Hunter's
+candidate — never invent prices. If ANTHROPIC_API_KEY is missing, a rule-based
+mock is used (Demo-friendly, deterministic).
 """
+
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
-from typing import Any
 
-from ..models import AgentResult, AnalystOutput, Bias, SweepCandidate, SweepDetails, TradePlan
-from ..settings import SETTINGS
-from .base import BaseAgent
+from pydantic import ValidationError
 
-logger = logging.getLogger("quantpilot.analyst")
+from ..core.models import AnalysisDecision, AgentResult
+from .base import Agent
 
-SYSTEM_PROMPT = (
-    "You are the Analyst agent of QUANT PILOT. You receive a liquidity-sweep "
-    "candidate from the Hunter plus compact market context. You may only REFINE "
-    "or REJECT the candidate. You must NEVER invent prices that are not in the "
-    "input. Reply with STRICT JSON only, no prose, no markdown, exactly this "
-    "shape: {\"instrument\": string, \"bias\": \"BULLISH_SWEEP_LONG\" | "
-    "\"BEARISH_SWEEP_SHORT\" | \"NO_TRADE\", \"confidence_score\": int 1-10, "
-    "\"htf_level_targeted\": string, \"sweep_details\": {\"instrument\": string, "
-    "\"level_type\": string, \"level_price\": number, \"extension_depth\": number, "
-    "\"displacement_quality\": number 0-1, \"candles_to_close\": int, "
-    "\"wick_extreme\": number}, \"trade_plan\": {\"entry_price\": number, "
-    "\"stop_loss\": number, \"take_profit_1\": number, \"take_profit_2\": number, "
-    "\"risk_reward_ratio\": number}, \"reasoning\": string max 3 sentences, "
-    "\"invalidation_conditions\": string}. If the setup is weak, return "
-    "bias=NO_TRADE with confidence_score 1 and keep the input prices unchanged."
+logger = logging.getLogger("quantpilot.agents.analyst")
+
+PROMPT = (
+    "You are the QUANT PILOT analyst. The Hunter detected a Liquidity Sweep setup. "
+    "You may ONLY refine or reject this candidate — never invent prices. "
+    "Return STRICT JSON matching this schema exactly:\n"
+    '{"instrument": str, "bias": "BULLISH_SWEEP_LONG"|"BEARISH_SWEEP_SHORT"|"NO_TRADE", '
+    '"confidence_score": int 1-10, "htf_level_targeted": str, '
+    '"sweep_details": {"extension_depth": number, "displacement_quality": number}, '
+    '"trade_plan": {"entry_price": number, "stop_loss": number, "take_profit_1": number, '
+    '"take_profit_2": number, "risk_reward_ratio": number}, '
+    '"reasoning": str (max 3 sentences), "invalidation_conditions": [str]}\n'
+    "Output ONLY the JSON object, no prose."
 )
 
 
-def _mock_output(candidate: SweepCandidate) -> AnalystOutput:
-    """Rule-based mock used when ANTHROPIC_API_KEY is missing."""
-    quality = candidate.displacement_quality
-    confidence = 8 if quality >= 0.7 else 5
-    bias = Bias.BULLISH_SWEEP_LONG if candidate.direction == "long" else Bias.BEARISH_SWEEP_SHORT
-    if quality < 0.5 or candidate.risk_reward_ratio < 2.0:
-        bias = Bias.NO_TRADE
-        confidence = 2
-    return AnalystOutput(
-        instrument=candidate.instrument,
+def _rule_based_decision(candidate: dict) -> AnalysisDecision:
+    """Deterministic mock used when no Claude key is configured."""
+    direction = candidate.get("direction", "LONG")
+    bias = "BULLISH_SWEEP_LONG" if direction == "LONG" else "BEARISH_SWEEP_SHORT"
+    depth = float(candidate.get("sweep_details", {}).get("extension_depth", 0.0))
+    displacement = float(candidate.get("sweep_details", {}).get("displacement_quality", 1.3))
+    conf = 8 if displacement >= 1.5 and depth > 0 else 6
+    if conf < 7:
+        bias = "NO_TRADE"
+    return AnalysisDecision(
+        instrument=candidate.get("instrument", "XAUUSD"),
         bias=bias,
-        confidence_score=confidence,
-        htf_level_targeted=candidate.level_type,
-        sweep_details=SweepDetails(
-            instrument=candidate.instrument,
-            level_type=candidate.level_type,
-            level_price=candidate.level_price,
-            extension_depth=candidate.extension_depth,
-            displacement_quality=candidate.displacement_quality,
-            candles_to_close=candidate.candles_to_close,
-            wick_extreme=candidate.wick_extreme,
-        ),
-        trade_plan=TradePlan(
-            entry_price=candidate.entry_price,
-            stop_loss=candidate.stop_loss,
-            take_profit_1=candidate.take_profit_1,
-            take_profit_2=candidate.take_profit_2,
-            risk_reward_ratio=candidate.risk_reward_ratio,
-        ),
+        confidence_score=conf,
+        htf_level_targeted=str(candidate.get("htf_level_targeted", "unknown")),
+        sweep_details={
+            "extension_depth": depth,
+            "displacement_quality": displacement,
+        },
+        trade_plan={
+            "entry_price": float(candidate["entry_price"]),
+            "stop_loss": float(candidate["stop_loss"]),
+            "take_profit_1": float(candidate["take_profit_1"]),
+            "take_profit_2": float(candidate["take_profit_2"]),
+            "risk_reward_ratio": float(candidate["risk_reward_ratio"]),
+        },
         reasoning=(
-            f"{candidate.level_type} swept by {candidate.extension_depth:.2f}. "
-            f"Displacement closed back inside in {candidate.candles_to_close} candle(s). "
-            f"Risk/reward {candidate.risk_reward_ratio} meets the 1:2 minimum."
+            "Rule-based mock analyst (no ANTHROPIC_API_KEY set): sweep depth and displacement "
+            "meet the strategy thresholds, and the candidate aligns with the mapped liquidity level. "
+            "Approved subject to AEGIS risk guardian vetoes."
         ),
-        invalidation_conditions="Close back beyond the swept level; spread above limit; session rollover.",
+        invalidation_conditions=[
+            "No re-entry inside the range within 3 candles",
+            "News-hour filter triggered",
+            "Close back through the swept level",
+        ],
     )
 
 
-def _parse_claude(text: str, candidate: SweepCandidate) -> AnalystOutput:
-    """Validate strict JSON from Claude; raise ValueError on failure."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("```", 2)[1] if cleaned.count("```") >= 2 else cleaned
-    cleaned = cleaned.strip()
-    if cleaned.startswith("{"):
-        # take the outermost object only
-        depth = 0
-        for i, ch in enumerate(cleaned):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    cleaned = cleaned[: i + 1]
-                    break
-    raw = json.loads(cleaned)
-    # Guard: Claude may not invent prices outside the candidate's bounds.
-    plan = raw.get("trade_plan", {})
-    for key in ("entry_price", "stop_loss", "take_profit_1", "take_profit_2"):
-        if key in plan:
-            cand_val = {
-                "entry_price": candidate.entry_price,
-                "stop_loss": candidate.stop_loss,
-                "take_profit_1": candidate.take_profit_1,
-                "take_profit_2": candidate.take_profit_2,
-            }[key]
-            if not isinstance(plan[key], (int, float)) or plan[key] <= 0:
-                plan[key] = cand_val
-            # allow refinement within +/-2% only
-            if abs(plan[key] - cand_val) / cand_val > 0.02:
-                plan[key] = cand_val
-    raw["trade_plan"] = plan
-    raw.setdefault("instrument", candidate.instrument)
-    return AnalystOutput(**raw)
-
-
-def _call_claude(payload: dict[str, Any]) -> str:
+def _call_claude(candidate: dict) -> dict:  # pragma: no cover - requires API key
     import anthropic
 
-    if SETTINGS is None:
-        raise RuntimeError("settings missing")
-    client = anthropic.Anthropic(api_key=SETTINGS.anthropic_api_key)
-    resp = client.messages.create(
-        model=SETTINGS.anthropic_model,
-        max_tokens=512,
-        temperature=0.0,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": json.dumps(payload)}],
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+    msg = client.messages.create(
+        model=model,
+        max_tokens=800,
+        system=PROMPT,
+        messages=[{"role": "user", "content": json.dumps({"candidate": candidate})}],
     )
-    return resp.content[0].text  # type: ignore[union-attr]
+    text = "".join(block.text for block in msg.content if getattr(block, "type", "") == "text")
+    return json.loads(text)
 
 
-class AnalystAgent(BaseAgent):
-    name = "analyst"
+class AnalystAgent(Agent):
+    name = "ANALYST"
 
-    def run(self, context: dict[str, Any]) -> AgentResult:
-        start = time.time()
-        candidate = context.get("candidate")
-        if candidate is None:
+    def __init__(self, use_claude: bool | None = None) -> None:
+        self._use_claude = bool(os.environ.get("ANTHROPIC_API_KEY")) if use_claude is None else use_claude
+
+    def run(self, context: dict) -> AgentResult:
+        started = time.perf_counter()
+        instrument: str = context.get("instrument", "XAUUSD")
+        candidate = context.get("hunter_candidate") or (context.get("signal") or {}).get("candidate") or context.get("candidate")
+
+        if context.get("no_trade") or not candidate:
             return self._result(
-                "skipped", "Analyst: no candidate from Hunter", {}, 1, self.timed(start)
+                "NO_TRADE",
+                "No Hunter candidate to analyze",
+                data={"instrument": instrument},
+                confidence=0.0,
+                started=started,
             )
-        if isinstance(candidate, dict):
-            candidate = SweepCandidate(**candidate)
 
-        payload = {
-            "instrument": candidate.instrument,
-            "direction": candidate.direction,
-            "level_type": candidate.level_type,
-            "level_price": candidate.level_price,
-            "wick_extreme": candidate.wick_extreme,
-            "extension_depth": candidate.extension_depth,
-            "candles_to_close": candidate.candles_to_close,
-            "displacement_quality": candidate.displacement_quality,
-            "session": candidate.session,
-            "rr": candidate.risk_reward_ratio,
-            "entry_price": candidate.entry_price,
-            "stop_loss": candidate.stop_loss,
-            "take_profit_1": candidate.take_profit_1,
-            "take_profit_2": candidate.take_profit_2,
-            "rsi": context.get("rsi"),
-            "spread": context.get("spread"),
-        }
-
-        api_key = SETTINGS.anthropic_api_key if SETTINGS else ""
-        used_mock = False
-        try:
-            if api_key:
-                text = _call_claude(payload)
-                output = _parse_claude(text, candidate)
-            else:
-                output = _mock_output(candidate)
-                used_mock = True
-        except Exception as e:
-            logger.warning("Analyst claude failed: %s", e)
+        decision: AnalysisDecision | None = None
+        used = "MOCK_RULE_BASED"
+        if self._use_claude:
             try:
-                output = _parse_claude(json.dumps({}), candidate)
-            except Exception:
-                output = _mock_output(candidate)
-                used_mock = True
+                raw = _call_claude(candidate)
+                decision = AnalysisDecision.model_validate(raw)
+                used = "CLAUDE_LIVE"
+            except Exception as exc:
+                logger.warning("Claude call failed (%s); retrying once", exc)
+                try:  # one retry
+                    raw = _call_claude(candidate)
+                    decision = AnalysisDecision.model_validate(raw)
+                    used = "CLAUDE_LIVE"
+                except Exception as exc2:
+                    logger.warning("Claude retry failed (%s) — NO_TRADE", exc2)
+        else:
+            decision = _rule_based_decision(candidate)
 
-        latency = self.timed(start)
-        summary = (
-            f"Analyst: bias={output.bias.value} conf={output.confidence_score} "
-            f"rr={output.trade_plan.risk_reward_ratio}"
-            + (" (mock)" if used_mock else "")
+        if decision is None or decision.bias == "NO_TRADE":
+            return self._result(
+                "NO_TRADE",
+                "Analyst rejected the candidate (or no valid response) — NO_TRADE",
+                data={"instrument": instrument, "analyst_source": used},
+                confidence=0.0,
+                started=started,
+            )
+
+        # Claude may only refine/reject — enforce Hunter's prices when present
+        tp = decision.trade_plan
+        refined = dict(tp.model_dump())
+        for key, src in (("entry_price", "entry_price"), ("stop_loss", "stop_loss"), ("take_profit_1", "take_profit_1"), ("take_profit_2", "take_profit_2")):
+            if src in candidate and candidate[src] is not None:
+                refined[key] = float(candidate[src])
+        refined["risk_reward_ratio"] = (
+            abs(refined["take_profit_1"] - refined["entry_price"]) / abs(refined["entry_price"] - refined["stop_loss"])
+            if abs(refined["entry_price"] - refined["stop_loss"]) > 0 else 0.0
         )
+
         return self._result(
-            "ok" if output.bias != Bias.NO_TRADE else "skipped",
-            summary,
-            {
-                "analyst_output": output.model_dump(),
-                "used_mock": used_mock,
-                "latency_ms": latency,
+            "CANDIDATE",
+            (
+                f"Analyst ({used}): {decision.bias}, confidence {decision.confidence_score}/10 — "
+                f"{decision.reasoning}"
+            ),
+            data={
+                "instrument": instrument,
+                "analyst_source": used,
+                "analysis": decision.model_dump(mode="json"),
+                "trade_plan": refined,
+                "htf_level_targeted": decision.htf_level_targeted,
+                "sweep_details": decision.sweep_details,
+                "invalidation_conditions": decision.invalidation_conditions,
+                "bias": decision.bias,
+                "confidence_score": decision.confidence_score,
+                "reasoning": decision.reasoning,
             },
-            confidence=output.confidence_score,
-            latency_ms=latency,
+            confidence=min(decision.confidence_score / 10.0, 1.0),
+            started=started,
         )
